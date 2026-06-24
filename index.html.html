@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>JARVIS: NEURAL INTERFACE MK-X</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;900&family=JetBrains+Mono&display=swap');
+        body { margin: 0; background: #000; font-family: 'Orbitron', sans-serif; overflow: hidden; color: #00f3ff; }
+        canvas { position: absolute; top: 0; left: 0; z-index: 10; pointer-events: none; }
+        video { transform: scaleX(-1); object-fit: cover; width: 100vw; height: 100vh; position: absolute; top:0; left:0; }
+        
+        .hud-ui { position: absolute; inset: 0; z-index: 20; pointer-events: none; padding: 2rem; }
+        .glass { background: rgba(0, 15, 30, 0.85); border-left: 4px solid #00f3ff; padding: 15px; backdrop-filter: blur(10px); }
+        
+        .btn {
+            pointer-events: auto; background: rgba(0, 243, 255, 0.1); border: 1px solid #00f3ff;
+            padding: 10px 20px; font-size: 10px; cursor: pointer; letter-spacing: 2px;
+        }
+        .btn:hover { background: #00f3ff; color: #000; }
+        .btn-active { background: #00f3ff; color: #000; box-shadow: 0 0 15px #00f3ff; }
+
+        #boot-screen {
+            position: fixed; inset: 0; z-index: 100; background: #000;
+            display: flex; flex-direction: column; align-items: center; justify-content: center;
+        }
+        .alert-strobe { animation: strobe 0.3s infinite; background: rgba(255, 0, 0, 0.3) !important; border-color: red !important; }
+        @keyframes strobe { 0% { opacity: 1; } 50% { opacity: 0.5; } }
+    </style>
+</head>
+<body>
+
+    <!-- BOOT LOADER (Necessary for Browser Permissions) -->
+    <div id="boot-screen">
+        <div class="mb-8 text-center">
+            <h1 class="text-4xl font-black tracking-tighter mb-2">STARK INDUSTRIES</h1>
+            <p class="text-xs text-cyan-500 font-mono">NEURAL INTERFACE PROTOCOL v10.4</p>
+        </div>
+        <button id="init-btn" class="btn text-xl px-12 py-6">INITIALIZE SYSTEM</button>
+        <div id="log-console" class="mt-8 font-mono text-[10px] text-gray-500 w-64 text-left">
+            > Awaiting user authorization...
+        </div>
+    </div>
+
+    <video id="input_video" playsinline></video>
+    <canvas id="output_canvas"></canvas>
+
+    <div class="hud-ui flex flex-col justify-between">
+        <!-- TOP HUD -->
+        <div class="flex justify-between items-start">
+            <div class="glass" id="status-panel">
+                <div class="text-[9px] opacity-60">SYSTEM STATUS</div>
+                <div id="mode-display" class="text-xl font-black italic">PROTOCOL: OFFLINE</div>
+                <div id="voice-indicator" class="text-[10px] mt-1 font-bold">MIC_STATUS: <span id="mic-status" class="text-red-500">OFFLINE</span></div>
+            </div>
+            <div class="glass text-right !border-l-0 !border-r-4 !border-yellow-400">
+                <div class="text-[9px] opacity-60">BIOMETRIC FEED</div>
+                <div id="eye-readout" class="text-white text-lg">EYES: SCANNING</div>
+                <div id="scale-readout" class="text-[9px] font-mono text-yellow-400">SCALE_SYNC: 1.00</div>
+            </div>
+        </div>
+
+        <!-- VOICE BUBBLE -->
+        <div id="ai-bubble" class="self-center glass border-2 border-cyan-400 hidden animate-pulse">
+            <div class="text-[8px] text-cyan-400 mb-1">JARVIS_RESPONSE</div>
+            <div id="ai-text" class="text-white text-sm font-mono italic uppercase"></div>
+        </div>
+
+        <!-- CONTROLS -->
+        <div class="flex justify-center gap-4">
+            <button onclick="setMode('standard')" id="btn-std" class="btn btn-active">STANDARD</button>
+            <button onclick="setMode('stealth')" id="btn-stl" class="btn">STEALTH</button>
+            <button onclick="setMode('quantum')" id="btn-qnt" class="btn">QUANTUM MK-X</button>
+        </div>
+
+        <!-- FOOTER -->
+        <div class="flex justify-between items-end text-[8px] font-mono opacity-50">
+            <div>
+                LATENCY: <span id="lat">12</span>ms<br>
+                SECURE_LINE: ACTIVE
+            </div>
+            <div class="w-48 h-1 bg-white/10"><div id="stealth-bar" class="h-full bg-cyan-400 w-0"></div></div>
+        </div>
+    </div>
+
+    <script type="module">
+        const videoElement = document.getElementById('input_video');
+        const canvasElement = document.getElementById('output_canvas');
+        const logConsole = document.getElementById('log-console');
+        const micStatus = document.getElementById('mic-status');
+        const aiBubble = document.getElementById('ai-bubble');
+        const aiText = document.getElementById('ai-text');
+
+        let scene, camera, renderer, helmetStd, helmetQuantum;
+        let currentMode = 'standard'; 
+        let eyesClosedStart = null;
+        let isSystemSpeaking = false;
+
+        const log = (msg) => { logConsole.innerHTML += `<br>> ${msg}`; };
+
+        // 1. SPEECH ENGINE
+        const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+        const recognition = SpeechRecognition ? new SpeechRecognition() : null;
+
+        if (recognition) {
+            recognition.continuous = false;
+            recognition.lang = 'en-US';
+            recognition.onend = () => { if (currentMode === 'quantum' && !isSystemSpeaking) recognition.start(); };
+            recognition.onresult = (event) => {
+                const transcript = event.results[0][0].transcript.toLowerCase();
+                handleCommands(transcript);
+            };
+        }
+
+        function speak(text) {
+            isSystemSpeaking = true;
+            if(recognition) recognition.stop();
+            const utter = new SpeechSynthesisUtterance(text);
+            utter.rate = 1.0; utter.pitch = 0.85;
+            utter.onstart = () => {
+                aiBubble.classList.remove('hidden');
+                aiText.innerText = text;
+                micStatus.innerText = "PROCESSING...";
+            };
+            utter.onend = () => {
+                isSystemSpeaking = false;
+                setTimeout(() => {
+                    aiBubble.classList.add('hidden');
+                    if (currentMode === 'quantum') recognition.start();
+                }, 1500);
+            };
+            window.speechSynthesis.speak(utter);
+        }
+
+        function handleCommands(cmd) {
+            log("Voice Cmd: " + cmd);
+            if (cmd.includes("time")) speak("The time is " + new Date().toLocaleTimeString());
+            else if (cmd.includes("temperature")) speak("Ambient temperature is 24 degrees Celsius.");
+            else if (cmd.includes("status")) speak("All systems nominal. Quantum interface stable.");
+            else if (cmd.includes("who are you")) speak("I am Jarvis, your neural artificial intelligence.");
+        }
+
+        // 2. MODES
+        window.setMode = (mode) => {
+            currentMode = mode;
+            document.querySelectorAll('.btn').forEach(b => b.classList.remove('btn-active'));
+            document.getElementById('btn-std').classList.toggle('btn-active', mode === 'standard');
+            document.getElementById('btn-stl').classList.toggle('btn-active', mode === 'stealth');
+            document.getElementById('btn-qnt').classList.toggle('btn-active', mode === 'quantum');
+            
+            if(mode === 'quantum') {
+                document.getElementById('mode-display').innerText = "PROTOCOL: QUANTUM MK-X";
+                micStatus.innerText = "LISTENING";
+                micStatus.className = "text-green-500 animate-pulse";
+                speak("Quantum Mode Engaged. I am listening for your commands.");
+            } else {
+                document.getElementById('mode-display').innerText = `PROTOCOL: ${mode.toUpperCase()}`;
+                micStatus.innerText = "OFFLINE";
+                micStatus.className = "text-red-500";
+                if(recognition) recognition.stop();
+            }
+        };
+
+        // 3. THREE.JS
+        function initThree() {
+            scene = new THREE.Scene();
+            camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1000);
+            renderer = new THREE.WebGLRenderer({ canvas: canvasElement, alpha: true, antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.localClippingEnabled = true;
+
+            const tClip = new THREE.Plane(new THREE.Vector3(0, -1, 0), 0.12);
+            const bClip = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0.08);
+
+            helmetStd = new THREE.Group();
+            const m1 = new THREE.Mesh(new THREE.SphereGeometry(1, 32, 32), new THREE.MeshBasicMaterial({ color: 0xccff00, wireframe: true, clippingPlanes:[tClip, bClip]}));
+            helmetStd.add(m1);
+            scene.add(helmetStd);
+
+            helmetQuantum = new THREE.Group();
+            const m2 = new THREE.Mesh(new THREE.TorusKnotGeometry(0.8, 0.2, 100, 16), new THREE.MeshBasicMaterial({ color: 0x00f3ff, wireframe: true, clippingPlanes:[tClip, bClip]}));
+            helmetQuantum.add(m2);
+            helmetQuantum.visible = false;
+            scene.add(helmetQuantum);
+
+            camera.position.z = 2.5;
+            log("3D Engine Loaded.");
+        }
+
+        // 4. MAIN AR LOGIC
+        function onResults(results) {
+            if (!results.multiFaceLandmarks || results.multiFaceLandmarks.length === 0 || currentMode === 'stealth') {
+                helmetStd.visible = helmetQuantum.visible = false;
+                return;
+            }
+            const l = results.multiFaceLandmarks[0];
+            const nose = l[1], tL = l[234], tR = l[454], fH = l[10], ch = l[152];
+
+            // Auto-Scale
+            const headScale = Math.sqrt(Math.pow(tR.x-tL.x, 2) + Math.pow(tR.y-tL.y, 2)) * 2.35;
+            document.getElementById('scale-readout').innerText = "SCALE_SYNC: " + headScale.toFixed(2);
+
+            const active = currentMode === 'quantum' ? helmetQuantum : helmetStd;
+            active.visible = true;
+            active.scale.set(headScale, headScale * 1.1, headScale);
+            active.position.lerp(new THREE.Vector3((nose.x-0.5)*-2.8, (nose.y-0.5)*-2, -nose.z*5), 0.3);
+            active.rotation.x = THREE.MathUtils.lerp(active.rotation.x, Math.atan2(ch.y-fH.y, ch.z-fH.z) + Math.PI/2, 0.2);
+            active.rotation.y = THREE.MathUtils.lerp(active.rotation.y, -Math.atan2(tR.z-tL.z, tR.x-tL.x), 0.2);
+
+            // Eye Alert
+            const eL = Math.abs(l[159].y - l[145].y), eR = Math.abs(l[386].y - l[374].y);
+            if (eL < 0.013 && eR < 0.013) {
+                if(!eyesClosedStart) eyesClosedStart = Date.now();
+                if(Date.now() - eyesClosedStart > 2500) {
+                    document.getElementById('status-panel').classList.add('alert-strobe');
+                    playAlarm();
+                }
+                document.getElementById('eye-readout').innerText = "EYES: CLOSED!";
+                document.getElementById('eye-readout').style.color = "red";
+            } else {
+                eyesClosedStart = null;
+                document.getElementById('status-panel').classList.remove('alert-strobe');
+                document.getElementById('eye-readout').innerText = "EYES: OPEN";
+                document.getElementById('eye-readout').style.color = "white";
+                stopAlarm();
+            }
+        }
+
+        const audioCtx = new AudioContext();
+        let osc = null;
+        function playAlarm() { if(!osc) { osc = audioCtx.createOscillator(); osc.type='sawtooth'; osc.connect(audioCtx.destination); osc.start(); } }
+        function stopAlarm() { if(osc) { osc.stop(); osc = null; } }
+
+        // BOOT SEQUENCE
+        document.getElementById('init-btn').addEventListener('click', async () => {
+            log("Requesting permissions...");
+            try {
+                initThree();
+                const faceMesh = new FaceMesh({locateFile: (f) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${f}`});
+                faceMesh.setOptions({maxNumFaces: 1, refineLandmarks: true, minDetectionConfidence: 0.6});
+                faceMesh.onResults(onResults);
+                const cam = new Camera(videoElement, {onFrame: async() => await faceMesh.send({image:videoElement}), width:1280, height:720});
+                await cam.start();
+                log("Camera Online.");
+                document.getElementById('boot-screen').style.display = 'none';
+                setMode('standard');
+                function anim() { requestAnimationFrame(anim); if(currentMode==='quantum') helmetQuantum.rotation.z+=0.01; renderer.render(scene, camera); }
+                anim();
+            } catch(e) { log("ERR: " + e.message); }
+        });
+    </script>
+</body>
+</html>
